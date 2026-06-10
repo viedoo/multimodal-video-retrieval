@@ -1,0 +1,16 @@
+.venv/
+.downloads/
+.factory/
+.pip-cache/
+.tmp/
+__pycache__/
+*.py[cod]
+dataset/
+logs/
+videos/
+subtitles/
+scenes/
+keyframes/
+thumbnails/
+proxies/
+gemini_summary/

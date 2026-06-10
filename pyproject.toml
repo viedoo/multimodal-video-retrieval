@@ -1,0 +1,38 @@
+[project]
+name = "youtube-download-pipeline"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "imageio-ffmpeg",
+    "numpy",
+    "opencv-python",
+    "scenedetect",
+    "yt-dlp",
+]
+
+[project.scripts]
+youtube-pipeline = "youtube_pipeline.cli:main"
+scene-pipeline = "youtube_pipeline.scenes:main"
+keyframe-pipeline = "youtube_pipeline.keyframes:main"
+thumbnail-pipeline = "youtube_pipeline.thumbnails:main"
+translate-subtitles = "youtube_pipeline.translate_subtitles:main"
+ocr-pipeline = "youtube_pipeline.ocr:main"
+batch-pipeline = "youtube_pipeline.batch:main"
+stage-pipeline = "youtube_pipeline.stage_pipeline:main"
+gemini-summary = "youtube_pipeline.gemini_summary:main"
+
+[project.optional-dependencies]
+ocr = [
+    "paddleocr>=3.6,<3.7",
+]
+ocr-cpu = [
+    "paddleocr>=3.6,<3.7",
+    "paddlepaddle>=3.3,<3.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/youtube_pipeline"]
