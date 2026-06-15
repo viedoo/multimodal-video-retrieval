@@ -1,0 +1,37 @@
+[
+  {
+    "canonical": "Hồ Chí Minh",
+    "type": "PERSON",
+    "aliases": ["Ho Chi Minh", "Bác Hồ", "Nguyễn Ái Quốc"]
+  },
+  {
+    "canonical": "Thành phố Hồ Chí Minh",
+    "type": "LOCATION",
+    "aliases": ["Hồ Chí Minh", "TP Hồ Chí Minh", "TP.HCM", "TP HCM", "Ho Chi Minh City", "Sài Gòn", "Saigon"]
+  },
+  {
+    "canonical": "Xuân Diệu",
+    "type": "PERSON",
+    "aliases": ["Xuan Dieu", "Ngô Xuân Diệu"]
+  },
+  {
+    "canonical": "Anthropic",
+    "type": "ORG",
+    "aliases": ["NTHROPIC"]
+  },
+  {
+    "canonical": "OpenAI",
+    "type": "ORG",
+    "aliases": ["Open AI"]
+  },
+  {
+    "canonical": "OpenClaw",
+    "type": "MISC",
+    "aliases": ["Open Claw", "OpenCA", "Open CL"]
+  },
+  {
+    "canonical": "Claude Mythos",
+    "type": "MISC",
+    "aliases": ["Mythos", "Cloud Mythos", "Clouder Mythos", "Mhos", "Mithos"]
+  }
+]

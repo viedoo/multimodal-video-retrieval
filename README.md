@@ -59,3 +59,146 @@ dataset/
 logs/
 gemini_summary/
 ```
+
+## Normalize Retrieval Documents
+
+Build one retrieval document per scene by aligning subtitles and OCR with keyframe timestamps:
+
+```powershell
+.\.venv\Scripts\document-pipeline.exe --output dataset\documents.jsonl
+```
+
+Outputs:
+
+```text
+dataset/documents.jsonl
+dataset/documents_manifest.json
+```
+
+Each document includes proxy/source frame indexes, timestamps, keyframe paths, cleaned OCR, aligned subtitle tracks, combined searchable text, and direct YouTube timestamp URLs.
+
+## Build And Search Retrieval Indexes
+
+Install FAISS support:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[retrieval]"
+```
+
+Build SQLite FTS5/BM25 and NER fields:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe build
+```
+
+Build a FAISS index with Gemini embeddings:
+
+```powershell
+$env:GEMINI_API_KEY="YOUR_API_KEY"
+.\.venv\Scripts\retrieval-pipeline.exe embed --provider gemini
+```
+
+For an offline functional test, use deterministic hashing vectors:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe embed --provider hashing
+```
+
+Hybrid BM25 + FAISS + entity reranking:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe search "Xuân Diệu" --mode hybrid --limit 10
+```
+
+Add the multilingual BGE cross-encoder for final query/passage reranking. On Windows the CLI loads BGE before
+FAISS to avoid a native library load-order crash. Ollama query embeddings are released from GPU memory before
+reranking:
+
+```powershell
+$env:HF_HOME="D:\pipeline1\.models\huggingface"
+.\.venv\Scripts\retrieval-pipeline.exe search "AI nào có khả năng tự tìm lỗ hổng bảo mật?" `
+  --mode hybrid --reranker bge --reranker-device cuda --limit 10
+```
+
+By default BGE scores the first 50 candidates, keeps only candidates that passed reranking, drops results below a
+`0.20` final score, and removes results whose BGE logit falls more than `6.0` behind the best final result. Adjust
+these controls with `--rerank-top`, `--reranker-min-final-score`, and `--reranker-max-score-drop`. Returning fewer
+than `--limit` results is intentional when the remaining candidates are weak.
+
+Retrieval candidates are scene-level documents containing the scene subtitles and deduplicated OCR from all of
+its keyframes. The final passage, timestamp, frame index, and YouTube link are selected from the best matching
+keyframe in that scene.
+
+TF-IDF and entity-only retrieval:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe search "AI tự tìm lỗ hổng bảo mật" --mode tfidf
+.\.venv\Scripts\retrieval-pipeline.exe search "Ho Chi Minh" --mode entity
+```
+
+Build the index with Vietnamese ELECTRA NER:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[ner,retrieval]"
+$env:HF_HOME="D:\pipeline1\.models\huggingface"
+.\.venv\Scripts\retrieval-pipeline.exe build --ner-provider electra --ner-device auto
+```
+
+Entity aliases are editable in `config/entity_aliases.json`. The entity index normalizes accents and maps OCR/name
+variants to a canonical entity.
+
+Use local Nomic embeddings through Ollama:
+
+```powershell
+ollama pull nomic-embed-text
+.\.venv\Scripts\retrieval-pipeline.exe embed --provider ollama --model nomic-embed-text `
+  --dimension 768 --index dataset\faiss_nomic.index `
+  --metadata dataset\vector_metadata_nomic.json
+```
+
+Search the Nomic index explicitly (it does not replace the default FAISS index):
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe search "AI tự tìm lỗ hổng bảo mật" --mode semantic `
+  --index dataset\faiss_nomic.index --metadata dataset\vector_metadata_nomic.json
+```
+
+Evaluate each embedding provider with its matching index/metadata files. Do not compare semantic results while
+pointing at the default hashing index.
+
+## Evaluate Retrieval
+
+Create 60 bootstrap queries distributed across all indexed videos:
+
+```powershell
+.\.venv\Scripts\retrieval-eval.exe seed --count 60
+```
+
+Review `dataset/evaluation_queries.jsonl`: rewrite each query naturally, add every relevant scene to
+`relevant_document_ids`, then set `reviewed` to `true`. Bootstrap queries are useful for plumbing checks but are
+biased toward lexical retrieval and must not be treated as a final human gold set.
+
+Compare BM25, semantic, and hybrid retrieval:
+
+```powershell
+.\.venv\Scripts\retrieval-eval.exe run
+```
+
+Evaluate hybrid retrieval with BGE reranking:
+
+```powershell
+.\.venv\Scripts\retrieval-eval.exe run --modes hybrid --reranker bge --reranker-device cuda
+```
+
+Use only human-reviewed labels for final metrics:
+
+```powershell
+.\.venv\Scripts\retrieval-eval.exe run --reviewed-only
+```
+
+Outputs:
+
+```text
+dataset/evaluation_report.json
+dataset/evaluation_details.jsonl
+```

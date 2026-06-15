@@ -3,6 +3,8 @@
 .factory/
 .pip-cache/
 .tmp/
+.models/
+.tools/
 __pycache__/
 *.py[cod]
 dataset/

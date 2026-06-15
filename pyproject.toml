@@ -20,6 +20,9 @@ ocr-pipeline = "youtube_pipeline.ocr:main"
 batch-pipeline = "youtube_pipeline.batch:main"
 stage-pipeline = "youtube_pipeline.stage_pipeline:main"
 gemini-summary = "youtube_pipeline.gemini_summary:main"
+document-pipeline = "youtube_pipeline.documents:main"
+retrieval-pipeline = "youtube_pipeline.retrieval:main"
+retrieval-eval = "youtube_pipeline.evaluation:main"
 
 [project.optional-dependencies]
 ocr = [
@@ -28,6 +31,13 @@ ocr = [
 ocr-cpu = [
     "paddleocr>=3.6,<3.7",
     "paddlepaddle>=3.3,<3.4",
+]
+retrieval = [
+    "faiss-cpu>=1.14,<2",
+]
+ner = [
+    "torch>=2.7,<3",
+    "transformers>=4.52,<5",
 ]
 
 [build-system]
