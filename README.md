@@ -129,6 +129,58 @@ Retrieval candidates are scene-level documents containing the scene subtitles an
 its keyframes. The final passage, timestamp, frame index, and YouTube link are selected from the best matching
 keyframe in that scene.
 
+### Keyframe-Level Index
+
+`retrieval-pipeline build` now creates both scene rows and keyframe rows in SQLite. Scene rows are stored in
+`documents`; keyframe rows are stored in `keyframe_documents`. Each keyframe row contains local subtitle text,
+OCR from that exact frame, timestamp, source frame index, and a `parent_document_id` pointing back to its scene.
+
+Build a FAISS index for keyframes with local Nomic embeddings:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe embed --level keyframe --provider ollama --model nomic-embed-text `
+  --dimension 768 --index dataset\faiss_keyframes_nomic.index `
+  --metadata dataset\vector_metadata_keyframes_nomic.json
+```
+
+Search only keyframes with BM25:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe search "OPENCLAW" --mode bm25 --search-level keyframe --limit 10
+```
+
+Search both scene-level and keyframe-level indexes:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe search "OpenClaw khac tro ly AI truyen thong nhu the nao?" `
+  --mode hybrid --search-level both --reranker bge --reranker-device cuda `
+  --index dataset\faiss_nomic.index --metadata dataset\vector_metadata_nomic.json `
+  --keyframe-index dataset\faiss_keyframes_nomic.index `
+  --keyframe-metadata dataset\vector_metadata_keyframes_nomic.json --limit 10
+```
+
+Use `level=keyframe` in the output to identify results that came directly from a keyframe document.
+
+### Adaptive Retrieval
+
+Use `--adaptive` to let the CLI choose a retrieval strategy from the query:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe search "OPENCLAW" --adaptive `
+  --index dataset\faiss_nomic.index --metadata dataset\vector_metadata_nomic.json `
+  --keyframe-index dataset\faiss_keyframes_nomic.index `
+  --keyframe-metadata dataset\vector_metadata_keyframes_nomic.json --limit 10
+```
+
+Adaptive routing currently uses simple, explainable rules:
+
+- short entity/name queries: BM25 + entity search, include keyframe OCR, skip BGE for speed
+- OCR/text/frame/timestamp queries: search both scene and keyframe rows
+- semantic/paraphrase questions: enable hybrid search and BGE reranking
+- entity-like queries: increase entity score weight
+
+Add `--show-plan` to print the selected mode, search level, reranker, weights, and routing reasons.
+
 TF-IDF and entity-only retrieval:
 
 ```powershell
@@ -189,6 +241,53 @@ Evaluate hybrid retrieval with BGE reranking:
 ```powershell
 .\.venv\Scripts\retrieval-eval.exe run --modes hybrid --reranker bge --reranker-device cuda
 ```
+
+Evaluate adaptive routing:
+
+```powershell
+.\.venv\Scripts\retrieval-eval.exe run --modes hybrid --adaptive `
+  --index dataset\faiss_nomic.index --metadata dataset\vector_metadata_nomic.json `
+  --keyframe-index dataset\faiss_keyframes_nomic.index `
+  --keyframe-metadata dataset\vector_metadata_keyframes_nomic.json
+```
+
+## Incremental Indexing
+
+Use incremental indexing when `documents.jsonl` contains only new or changed videos. The command deletes old rows for
+those `video_id`s, inserts the new scene/keyframe rows, rebuilds FTS5, and recomputes TF-IDF stats without clearing the
+rest of the database:
+
+```powershell
+.\.venv\Scripts\retrieval-pipeline.exe build --documents dataset\documents_new.jsonl `
+  --db dataset\search_index.sqlite3 --incremental --no-overwrite
+```
+
+If embedding vectors changed, rebuild the matching FAISS file for the affected level. Current FAISS files are still
+written as full indexes; appending vectors incrementally is a later optimization.
+
+## Persistent Retrieval Server
+
+Run a long-lived HTTP server so FAISS indexes and BGE can stay cached in process:
+
+```powershell
+$env:HF_HOME="D:\pipeline1\.models\huggingface"
+.\.venv\Scripts\python.exe -m youtube_pipeline.retrieval_server `
+  --host 127.0.0.1 --port 8765 `
+  --db dataset\search_index.sqlite3 `
+  --index dataset\faiss_nomic.index --metadata dataset\vector_metadata_nomic.json `
+  --keyframe-index dataset\faiss_keyframes_nomic.index `
+  --keyframe-metadata dataset\vector_metadata_keyframes_nomic.json
+```
+
+Query it:
+
+```powershell
+$body = @{ query = "OPENCLAW"; adaptive = $true; limit = 5 } | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:8765/search -Method Post -ContentType "application/json" -Body $body
+```
+
+Use `--preload` to load FAISS and BGE before serving. For short entity/OCR queries, adaptive routing can skip semantic
+search and BGE, which keeps latency low.
 
 Use only human-reviewed labels for final metrics:
 

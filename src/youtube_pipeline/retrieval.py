@@ -26,6 +26,8 @@ DEFAULT_DOCUMENTS = DATASET_DIR / "documents.jsonl"
 DEFAULT_DB = DATASET_DIR / "search_index.sqlite3"
 DEFAULT_FAISS_INDEX = DATASET_DIR / "faiss.index"
 DEFAULT_VECTOR_METADATA = DATASET_DIR / "vector_metadata.json"
+DEFAULT_KEYFRAME_FAISS_INDEX = DATASET_DIR / "faiss_keyframes.index"
+DEFAULT_KEYFRAME_VECTOR_METADATA = DATASET_DIR / "vector_metadata_keyframes.json"
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-2"
 DEFAULT_ALIASES = ROOT / "config" / "entity_aliases.json"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
@@ -80,6 +82,8 @@ class SearchHit:
     combined_text: str
     entities: list[dict[str, str]]
     youtube_url: str
+    level: str = "scene"
+    parent_document_id: str | None = None
     bm25_rank: int | None = None
     semantic_rank: int | None = None
     entity_rank: int | None = None
@@ -102,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     build.add_argument("--documents", type=Path, default=DEFAULT_DOCUMENTS)
     build.add_argument("--db", type=Path, default=DEFAULT_DB)
     build.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
+    build.add_argument("--incremental", action="store_true", help="Upsert only videos present in --documents.")
     build.add_argument("--aliases", type=Path, default=DEFAULT_ALIASES)
     build.add_argument("--ner-provider", choices=["rules", "electra"], default="rules")
     build.add_argument("--ner-model", default="NlpHUST/ner-vietnamese-electra-base")
@@ -112,6 +117,7 @@ def parse_args() -> argparse.Namespace:
     embed.add_argument("--db", type=Path, default=DEFAULT_DB)
     embed.add_argument("--index", type=Path, default=DEFAULT_FAISS_INDEX)
     embed.add_argument("--metadata", type=Path, default=DEFAULT_VECTOR_METADATA)
+    embed.add_argument("--level", choices=["scene", "keyframe"], default="scene")
     embed.add_argument("--provider", choices=["gemini", "ollama", "hashing"], default="gemini")
     embed.add_argument("--model", default=DEFAULT_EMBEDDING_MODEL)
     embed.add_argument("--dimension", type=int, default=768)
@@ -128,7 +134,12 @@ def parse_args() -> argparse.Namespace:
     search.add_argument("--db", type=Path, default=DEFAULT_DB)
     search.add_argument("--index", type=Path, default=DEFAULT_FAISS_INDEX)
     search.add_argument("--metadata", type=Path, default=DEFAULT_VECTOR_METADATA)
+    search.add_argument("--keyframe-index", type=Path, default=DEFAULT_KEYFRAME_FAISS_INDEX)
+    search.add_argument("--keyframe-metadata", type=Path, default=DEFAULT_KEYFRAME_VECTOR_METADATA)
+    search.add_argument("--search-level", choices=["scene", "keyframe", "both"], default="scene")
     search.add_argument("--mode", choices=["bm25", "tfidf", "semantic", "entity", "hybrid"], default="hybrid")
+    search.add_argument("--adaptive", action="store_true", help="Route the query to a suitable retrieval strategy.")
+    search.add_argument("--show-plan", action="store_true", help="Print the adaptive retrieval plan to stderr.")
     search.add_argument("--limit", type=int, default=10)
     search.add_argument("--candidate-limit", type=int, default=50)
     search.add_argument("--provider", choices=["gemini", "ollama", "hashing"], default=None)
@@ -138,6 +149,7 @@ def parse_args() -> argparse.Namespace:
     search.add_argument("--aliases", type=Path, default=DEFAULT_ALIASES)
     search.add_argument("--bm25-weight", type=float, default=1.0)
     search.add_argument("--semantic-weight", type=float, default=1.0)
+    search.add_argument("--semantic-fallback", action=argparse.BooleanOptionalAction, default=True)
     search.add_argument("--entity-weight", type=float, default=0.35)
     search.add_argument("--rrf-k", type=int, default=60)
     search.add_argument("--dedupe-seconds", type=float, default=30.0)
@@ -149,6 +161,7 @@ def parse_args() -> argparse.Namespace:
     search.add_argument("--reranker-max-length", type=int, default=256)
     search.add_argument("--reranker-min-final-score", type=float, default=0.20)
     search.add_argument("--reranker-max-score-drop", type=float, default=6.0)
+    search.add_argument("--reranker-fallback", action=argparse.BooleanOptionalAction, default=True)
     search.add_argument("--json", action="store_true")
     return parser.parse_args()
 
@@ -164,7 +177,7 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         raise RuntimeError(f"Documents file not found: {path}")
     documents: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -317,6 +330,76 @@ def best_keyframe(document: dict[str, Any]) -> dict[str, Any] | None:
     return (with_ocr or keyframes)[0]
 
 
+def keyframe_document(scene_document: dict[str, Any], keyframe: dict[str, Any], index: int) -> dict[str, Any]:
+    timestamp = float(keyframe.get("timestamp_seconds") or scene_document.get("start_seconds") or 0.0)
+    frame = keyframe.get("source_frame_index")
+    frame_token = f"frame-{int(frame):06d}" if isinstance(frame, int) else f"keyframe-{index:03d}"
+    subtitle_text = keyframe.get("subtitle_text") or scene_document.get("subtitle_text") or ""
+    ocr_text = keyframe.get("ocr_text") or ""
+    combined_text = "\n".join(value for value in (subtitle_text, ocr_text) if value)
+    document_id = f"{scene_document['document_id']}:{frame_token}"
+    return {
+        "document_id": document_id,
+        "parent_document_id": scene_document["document_id"],
+        "video_id": scene_document["video_id"],
+        "scene_id": scene_document["scene_id"],
+        "start_seconds": timestamp,
+        "end_seconds": timestamp,
+        "source_start_frame": frame,
+        "source_end_frame": frame,
+        "subtitle_text": subtitle_text,
+        "ocr_text": ocr_text,
+        "combined_text": combined_text,
+        "youtube_url": keyframe.get("youtube_url") or scene_document.get("youtube_url") or "",
+        "keyframe": keyframe,
+        "keyframes": [keyframe],
+        "level": "keyframe",
+    }
+
+
+def document_entities_for_text(
+    text: str,
+    aliases: dict[str, list[dict[str, str]]],
+    model_entities: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    entities: list[dict[str, Any]] = extract_entities(text)
+    entities.extend(model_entities or [])
+    normalized_text = f" {search_key(text)} "
+    for alias_key, matches in aliases.items():
+        if alias_key and f" {alias_key} " in normalized_text:
+            for match in matches:
+                if (
+                    match["canonical"] == "Hồ Chí Minh"
+                    and match["type"] == "PERSON"
+                    and " thanh pho ho chi minh " in normalized_text
+                ):
+                    continue
+                entities.append(
+                    {
+                        "text": match["alias"],
+                        "type": match["type"],
+                        "source": "alias",
+                        "score": 1.0,
+                    }
+                )
+    entities = canonicalize_entities(entities, aliases)
+    has_ho_chi_minh_city = any(
+        entity["type"] == "LOCATION"
+        and search_key(entity["text"]) == "thanh pho ho chi minh"
+        for entity in entities
+    )
+    if has_ho_chi_minh_city:
+        entities = [
+            entity
+            for entity in entities
+            if not (
+                search_key(entity["text"]) == "ho chi minh"
+                and entity["type"] != "LOCATION"
+            )
+        ]
+    return entities
+
+
 def index_terms(text: str) -> Counter[str]:
     return Counter(
         token
@@ -330,8 +413,11 @@ def init_search_db(connection: sqlite3.Connection, overwrite: bool) -> None:
         connection.executescript(
             """
             DROP TABLE IF EXISTS documents_fts;
+            DROP TABLE IF EXISTS keyframe_documents_fts;
             DROP TABLE IF EXISTS documents;
+            DROP TABLE IF EXISTS keyframe_documents;
             DROP TABLE IF EXISTS document_entities;
+            DROP TABLE IF EXISTS keyframe_document_entities;
             DROP TABLE IF EXISTS entity_aliases;
             DROP TABLE IF EXISTS document_terms;
             DROP TABLE IF EXISTS document_term_norms;
@@ -358,12 +444,40 @@ def init_search_db(connection: sqlite3.Connection, overwrite: bool) -> None:
             keyframe_json TEXT,
             document_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS keyframe_documents (
+            id INTEGER PRIMARY KEY,
+            document_id TEXT NOT NULL UNIQUE,
+            parent_document_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            scene_id TEXT NOT NULL,
+            start_seconds REAL NOT NULL,
+            end_seconds REAL NOT NULL,
+            source_start_frame INTEGER,
+            source_end_frame INTEGER,
+            subtitle_text TEXT NOT NULL,
+            ocr_text TEXT NOT NULL,
+            combined_text TEXT NOT NULL,
+            entities_text TEXT NOT NULL,
+            entities_json TEXT NOT NULL,
+            youtube_url TEXT NOT NULL,
+            keyframe_json TEXT,
+            document_json TEXT NOT NULL
+        );
         CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
             subtitle_text,
             ocr_text,
             combined_text,
             entities_text,
             content='documents',
+            content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS keyframe_documents_fts USING fts5(
+            subtitle_text,
+            ocr_text,
+            combined_text,
+            entities_text,
+            content='keyframe_documents',
             content_rowid='id',
             tokenize='unicode61 remove_diacritics 2'
         );
@@ -388,6 +502,17 @@ def init_search_db(connection: sqlite3.Connection, overwrite: bool) -> None:
             PRIMARY KEY(document_id, canonical_key, entity_type)
         );
         CREATE INDEX IF NOT EXISTS idx_document_entities_key ON document_entities(canonical_key);
+        CREATE TABLE IF NOT EXISTS keyframe_document_entities (
+            document_id TEXT NOT NULL,
+            canonical TEXT NOT NULL,
+            canonical_key TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            matched_text TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'rules',
+            score REAL,
+            PRIMARY KEY(document_id, canonical_key, entity_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_keyframe_document_entities_key ON keyframe_document_entities(canonical_key);
         CREATE TABLE IF NOT EXISTS entity_aliases (
             canonical TEXT NOT NULL,
             canonical_key TEXT NOT NULL,
@@ -417,10 +542,76 @@ def init_search_db(connection: sqlite3.Connection, overwrite: bool) -> None:
     )
 
 
+def delete_indexed_videos(connection: sqlite3.Connection, video_ids: Iterable[str]) -> None:
+    ids = sorted(set(video_ids))
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    document_ids = [
+        row["document_id"]
+        for row in connection.execute(
+            f"SELECT document_id FROM documents WHERE video_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    ]
+    keyframe_ids = [
+        row["document_id"]
+        for row in connection.execute(
+            f"SELECT document_id FROM keyframe_documents WHERE video_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    ]
+    if document_ids:
+        doc_placeholders = ",".join("?" for _ in document_ids)
+        connection.execute(f"DELETE FROM document_entities WHERE document_id IN ({doc_placeholders})", document_ids)
+        connection.execute(f"DELETE FROM document_terms WHERE document_id IN ({doc_placeholders})", document_ids)
+    if keyframe_ids:
+        kf_placeholders = ",".join("?" for _ in keyframe_ids)
+        connection.execute(
+            f"DELETE FROM keyframe_document_entities WHERE document_id IN ({kf_placeholders})",
+            keyframe_ids,
+        )
+    connection.execute(f"DELETE FROM keyframe_documents WHERE video_id IN ({placeholders})", ids)
+    connection.execute(f"DELETE FROM documents WHERE video_id IN ({placeholders})", ids)
+
+
+def rebuild_tfidf_stats(connection: sqlite3.Connection) -> None:
+    connection.execute("DELETE FROM term_stats")
+    connection.execute("DELETE FROM document_term_norms")
+    rows = connection.execute("SELECT document_id, term, tf FROM document_terms").fetchall()
+    by_document: dict[str, Counter[str]] = {}
+    document_frequencies: Counter[str] = Counter()
+    for row in rows:
+        document_id = row["document_id"]
+        by_document.setdefault(document_id, Counter())[row["term"]] = int(row["tf"])
+    for terms in by_document.values():
+        document_frequencies.update(terms.keys())
+    searchable_count = max(1, len(by_document))
+    idf_values = {
+        term: math.log((searchable_count + 1) / (frequency + 1)) + 1.0
+        for term, frequency in document_frequencies.items()
+    }
+    connection.executemany(
+        "INSERT INTO term_stats(term, document_frequency, inverse_document_frequency) VALUES (?, ?, ?)",
+        ((term, frequency, idf_values[term]) for term, frequency in document_frequencies.items()),
+    )
+    connection.executemany(
+        "INSERT INTO document_term_norms(document_id, vector_norm) VALUES (?, ?)",
+        (
+            (
+                document_id,
+                math.sqrt(sum(((1.0 + math.log(tf)) * idf_values[term]) ** 2 for term, tf in terms.items())) or 1.0,
+            )
+            for document_id, terms in by_document.items()
+        ),
+    )
+
+
 def build_index(
     documents_path: Path,
     db_path: Path,
     overwrite: bool,
+    incremental: bool = False,
     aliases_path: Path = DEFAULT_ALIASES,
     ner_provider: str = "rules",
     ner_model: str = "NlpHUST/ner-vietnamese-electra-base",
@@ -441,13 +632,18 @@ def build_index(
         else [[] for _ in documents]
     )
     with connect(db_path) as connection:
-        init_search_db(connection, overwrite)
-        connection.execute("DELETE FROM documents")
-        connection.execute("DELETE FROM document_entities")
-        connection.execute("DELETE FROM entity_aliases")
-        connection.execute("DELETE FROM document_terms")
-        connection.execute("DELETE FROM document_term_norms")
-        connection.execute("DELETE FROM term_stats")
+        init_search_db(connection, overwrite and not incremental)
+        if incremental:
+            delete_indexed_videos(connection, {document["video_id"] for document in documents})
+        else:
+            connection.execute("DELETE FROM documents")
+            connection.execute("DELETE FROM keyframe_documents")
+            connection.execute("DELETE FROM document_entities")
+            connection.execute("DELETE FROM keyframe_document_entities")
+            connection.execute("DELETE FROM entity_aliases")
+            connection.execute("DELETE FROM document_terms")
+            connection.execute("DELETE FROM document_term_norms")
+            connection.execute("DELETE FROM term_stats")
         for record in alias_records:
             for alias in record["aliases"]:
                 connection.execute(
@@ -463,6 +659,7 @@ def build_index(
                 )
         document_frequencies: Counter[str] = Counter()
         document_term_counts: dict[str, Counter[str]] = {}
+        keyframe_count = 0
         for item_index, document in enumerate(documents, start=1):
             combined_text = document.get("combined_text") or ""
             entities: list[dict[str, Any]] = extract_entities(combined_text)
@@ -504,7 +701,7 @@ def build_index(
             keyframe = best_keyframe(document)
             connection.execute(
                 """
-                INSERT INTO documents(
+                INSERT OR REPLACE INTO documents(
                     document_id, video_id, scene_id, start_seconds, end_seconds,
                     source_start_frame, source_end_frame, subtitle_text, ocr_text,
                     combined_text, entities_text, entities_json, youtube_url,
@@ -543,6 +740,56 @@ def build_index(
                         entity.get("source") or ner_provider, entity.get("score"),
                     ),
                 )
+            for keyframe_index, keyframe_item in enumerate(document.get("keyframes") or [], start=1):
+                keyframe_doc = keyframe_document(document, keyframe_item, keyframe_index)
+                keyframe_text = keyframe_doc["combined_text"]
+                if not keyframe_text:
+                    continue
+                keyframe_entities = document_entities_for_text(keyframe_text, aliases)
+                keyframe_entities_text = " ".join(entity["text"] for entity in keyframe_entities)
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO keyframe_documents(
+                        document_id, parent_document_id, video_id, scene_id,
+                        start_seconds, end_seconds, source_start_frame, source_end_frame,
+                        subtitle_text, ocr_text, combined_text, entities_text,
+                        entities_json, youtube_url, keyframe_json, document_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        keyframe_doc["document_id"],
+                        keyframe_doc["parent_document_id"],
+                        keyframe_doc["video_id"],
+                        keyframe_doc["scene_id"],
+                        keyframe_doc["start_seconds"],
+                        keyframe_doc["end_seconds"],
+                        keyframe_doc.get("source_start_frame"),
+                        keyframe_doc.get("source_end_frame"),
+                        keyframe_doc["subtitle_text"],
+                        keyframe_doc["ocr_text"],
+                        keyframe_text,
+                        keyframe_entities_text,
+                        json.dumps(keyframe_entities, ensure_ascii=False),
+                        keyframe_doc["youtube_url"],
+                        json.dumps(keyframe_item, ensure_ascii=False),
+                        json.dumps(keyframe_doc, ensure_ascii=False),
+                    ),
+                )
+                for entity in keyframe_entities:
+                    connection.execute(
+                        """
+                        INSERT OR REPLACE INTO keyframe_document_entities(
+                            document_id, canonical, canonical_key, entity_type,
+                            matched_text, source, score
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            keyframe_doc["document_id"], entity["text"], search_key(entity["text"]),
+                            entity["type"], entity.get("matched_text") or entity["text"],
+                            entity.get("source") or ner_provider, entity.get("score"),
+                        ),
+                    )
+                keyframe_count += 1
             terms = index_terms(combined_text)
             document_term_counts[document["document_id"]] = terms
             document_frequencies.update(terms.keys())
@@ -552,35 +799,14 @@ def build_index(
             )
             if item_index % 100 == 0:
                 print(f"[index] {item_index}/{len(documents)}")
-        searchable_count = max(1, sum(bool(index_terms(document.get("combined_text") or "")) for document in documents))
-        idf_values = {
-            term: math.log((searchable_count + 1) / (frequency + 1)) + 1.0
-            for term, frequency in document_frequencies.items()
-        }
-        connection.executemany(
-            "INSERT INTO term_stats(term, document_frequency, inverse_document_frequency) VALUES (?, ?, ?)",
-            (
-                (term, frequency, idf_values[term])
-                for term, frequency in document_frequencies.items()
-            ),
-        )
-        connection.executemany(
-            "INSERT INTO document_term_norms(document_id, vector_norm) VALUES (?, ?)",
-            (
-                (
-                    document_id,
-                    math.sqrt(
-                        sum(((1.0 + math.log(tf)) * idf_values[term]) ** 2 for term, tf in terms.items())
-                    ) or 1.0,
-                )
-                for document_id, terms in document_term_counts.items()
-            ),
-        )
+        rebuild_tfidf_stats(connection)
         connection.execute("INSERT INTO documents_fts(documents_fts) VALUES('rebuild')")
+        connection.execute("INSERT INTO keyframe_documents_fts(keyframe_documents_fts) VALUES('rebuild')")
         count = connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         searchable = connection.execute("SELECT COUNT(*) FROM documents WHERE combined_text != ''").fetchone()[0]
+        keyframes = connection.execute("SELECT COUNT(*) FROM keyframe_documents").fetchone()[0]
     print(
-        f"[index] {count} documents, {searchable} searchable, "
+        f"[index] {count} scene documents, {searchable} searchable, {keyframes} keyframe documents, "
         f"ner={ner_provider}, aliases={len(alias_records)} -> {db_path}"
     )
 
@@ -590,6 +816,20 @@ def fts_query(value: str) -> str:
     if not tokens:
         tokens = search_key(value).split()
     return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens)
+
+
+def retrieval_tables(level: str) -> dict[str, str]:
+    if level == "keyframe":
+        return {
+            "documents": "keyframe_documents",
+            "fts": "keyframe_documents_fts",
+            "entities": "keyframe_document_entities",
+        }
+    return {
+        "documents": "documents",
+        "fts": "documents_fts",
+        "entities": "document_entities",
+    }
 
 
 def resolve_query_entity_keys(connection: sqlite3.Connection, query: str) -> set[str]:
@@ -625,6 +865,8 @@ def row_to_hit(row: sqlite3.Row, **scores: Any) -> SearchHit:
         combined_text=row["combined_text"],
         entities=json.loads(row["entities_json"]),
         youtube_url=row["youtube_url"],
+        level=document.get("level") or "scene",
+        parent_document_id=document.get("parent_document_id"),
         **scores,
     )
 
@@ -685,16 +927,31 @@ def attach_best_passages(hits: list[SearchHit], query: str) -> list[SearchHit]:
     return output
 
 
+_RERANKER_CACHE: dict[tuple[str, str, int], Any] = {}
+
+
 def load_reranker(args: argparse.Namespace) -> Any | None:
     if args.reranker == "none":
         return None
     from .reranker import TransformerReranker
 
-    return TransformerReranker(
-        args.reranker_model,
-        args.reranker_device,
-        args.reranker_max_length,
-    )
+    key = (args.reranker_model, args.reranker_device, args.reranker_max_length)
+    if key not in _RERANKER_CACHE:
+        try:
+            _RERANKER_CACHE[key] = TransformerReranker(
+                args.reranker_model,
+                args.reranker_device,
+                args.reranker_max_length,
+            )
+        except (OSError, RuntimeError) as exc:
+            if not getattr(args, "reranker_fallback", True):
+                raise
+            print(
+                f"[reranker] disabled: failed to load {args.reranker_model}: {exc}",
+                file=sys.stderr,
+            )
+            return None
+    return _RERANKER_CACHE[key]
 
 
 def rerank_hits(args: argparse.Namespace, hits: list[SearchHit], reranker: Any | None = None) -> list[SearchHit]:
@@ -705,6 +962,8 @@ def rerank_hits(args: argparse.Namespace, hits: list[SearchHit], reranker: Any |
     rerank_count = min(args.rerank_top, len(hits))
     candidates = hits[:rerank_count]
     reranker = reranker or load_reranker(args)
+    if reranker is None:
+        return hits
     scores = reranker.score(
         args.query,
         [hit.matched_passage for hit in candidates],
@@ -754,18 +1013,19 @@ def rerank_hits(args: argparse.Namespace, hits: list[SearchHit], reranker: Any |
     ]
 
 
-def bm25_search(db_path: Path, query: str, limit: int) -> list[SearchHit]:
+def bm25_search(db_path: Path, query: str, limit: int, level: str = "scene") -> list[SearchHit]:
     expression = fts_query(query)
     if not expression:
         return []
+    tables = retrieval_tables(level)
     sql = """
-        SELECT d.*, bm25(documents_fts, 1.5, 0.7, 1.0, 2.5) AS score
-        FROM documents_fts
-        JOIN documents d ON d.id = documents_fts.rowid
-        WHERE documents_fts MATCH ?
+        SELECT d.*, bm25({fts}, 1.5, 0.7, 1.0, 2.5) AS score
+        FROM {fts}
+        JOIN {documents} d ON d.id = {fts}.rowid
+        WHERE {fts} MATCH ?
         ORDER BY score
         LIMIT ?
-    """
+    """.format(**tables)
     with connect(db_path) as connection:
         rows = connection.execute(sql, (expression, max(limit * 4, limit))).fetchall()
         query_terms = set(index_terms(query))
@@ -776,7 +1036,7 @@ def bm25_search(db_path: Path, query: str, limit: int) -> list[SearchHit]:
             entity_documents = {
                 row[0]
                 for row in connection.execute(
-                    f"SELECT DISTINCT document_id FROM document_entities WHERE canonical_key IN ({placeholders})",
+                    f"SELECT DISTINCT document_id FROM {tables['entities']} WHERE canonical_key IN ({placeholders})",
                     tuple(entity_keys),
                 )
             }
@@ -851,7 +1111,8 @@ def tfidf_search(db_path: Path, query: str, limit: int) -> list[SearchHit]:
     ]
 
 
-def entity_search(db_path: Path, query: str, limit: int) -> list[SearchHit]:
+def entity_search(db_path: Path, query: str, limit: int, level: str = "scene") -> list[SearchHit]:
+    tables = retrieval_tables(level)
     with connect(db_path) as connection:
         keys = resolve_query_entity_keys(connection, query)
         if not keys:
@@ -861,8 +1122,8 @@ def entity_search(db_path: Path, query: str, limit: int) -> list[SearchHit]:
             f"""
             SELECT de.document_id, COUNT(DISTINCT de.canonical_key) AS matched_entities,
                    MAX(COALESCE(de.score, 0.5)) AS confidence
-            FROM document_entities de
-            JOIN documents d ON d.document_id = de.document_id
+            FROM {tables['entities']} de
+            JOIN {tables['documents']} d ON d.document_id = de.document_id
             WHERE de.canonical_key IN ({placeholders})
             GROUP BY de.document_id
             ORDER BY matched_entities DESC, confidence DESC, LENGTH(d.combined_text) DESC
@@ -875,7 +1136,7 @@ def entity_search(db_path: Path, query: str, limit: int) -> list[SearchHit]:
             return []
         id_placeholders = ",".join("?" for _ in ids)
         documents = connection.execute(
-            f"SELECT * FROM documents WHERE document_id IN ({id_placeholders})", ids
+            f"SELECT * FROM {tables['documents']} WHERE document_id IN ({id_placeholders})", ids
         ).fetchall()
     by_id = {row["document_id"]: row for row in documents}
     return [
@@ -1050,12 +1311,28 @@ def import_faiss() -> Any:
     return faiss
 
 
+_FAISS_CACHE: dict[str, tuple[float, Any]] = {}
+
+
+def load_faiss_index(path: Path) -> Any:
+    resolved = str(path.resolve())
+    mtime = path.stat().st_mtime
+    cached = _FAISS_CACHE.get(resolved)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    faiss = import_faiss()
+    index = faiss.read_index(resolved)
+    _FAISS_CACHE[resolved] = (mtime, index)
+    return index
+
+
 def build_embeddings(args: argparse.Namespace) -> None:
     faiss = import_faiss()
     key = api_key(args.api_key) if args.provider == "gemini" else None
     with connect(args.db) as connection:
         init_search_db(connection, overwrite=False)
-        query = "SELECT document_id, combined_text FROM documents WHERE combined_text != '' ORDER BY id"
+        table = retrieval_tables(args.level)["documents"]
+        query = f"SELECT document_id, combined_text FROM {table} WHERE combined_text != '' ORDER BY id"
         rows = connection.execute(query).fetchall()
         if args.limit is not None:
             rows = rows[: args.limit]
@@ -1112,6 +1389,7 @@ def build_embeddings(args: argparse.Namespace) -> None:
         "provider": args.provider,
         "model": args.model,
         "dimension": args.dimension,
+        "level": args.level,
         "document_ids": document_ids,
         "count": len(document_ids),
         "metric": "cosine_via_normalized_inner_product",
@@ -1139,10 +1417,97 @@ def query_embedding(query: str, metadata: dict[str, Any], args: argparse.Namespa
     return hashing_embedding(content, dimension)
 
 
+FRAME_QUERY_TERMS = {
+    "frame", "khung", "hinh", "anh", "man", "hien", "xuat", "ocr", "chu", "logo", "text", "timestamp",
+    "thoi", "diem", "luc", "phut", "giay",
+}
+SEMANTIC_QUERY_TERMS = {
+    "khac", "giong", "tai", "sao", "vi", "sao", "nhu", "the", "nao", "giai", "thich", "tom", "tat",
+    "noi", "dung", "y", "nghia", "co", "the", "lam", "gi", "cach", "hoat", "dong",
+}
+EXACT_QUERY_TERMS = {
+    "viet", "ghi", "hien", "thi", "chu", "dong", "cau", "cum", "tu", "logo", "bien", "bang", "ocr",
+}
+
+
+def adaptive_plan(args: argparse.Namespace) -> dict[str, Any]:
+    terms = set(index_terms(args.query))
+    raw_terms = set(search_key(args.query).split())
+    quoted = bool(re.search(r"['\"].+['\"]", args.query))
+    uppercase_signal = bool(re.search(r"\b[A-ZĐ][A-ZĐ0-9_-]{2,}\b", args.query))
+    has_entity = bool(query_entity_keys(args.query) or uppercase_signal)
+    wants_frame = bool(terms & FRAME_QUERY_TERMS or raw_terms & FRAME_QUERY_TERMS)
+    semantic_intent = bool(terms & SEMANTIC_QUERY_TERMS or raw_terms & SEMANTIC_QUERY_TERMS)
+    exact_intent = quoted or bool(terms & EXACT_QUERY_TERMS or raw_terms & EXACT_QUERY_TERMS)
+
+    plan: dict[str, Any] = {
+        "mode": "hybrid",
+        "search_level": "both" if wants_frame or exact_intent else "scene",
+        "reranker": "bge" if semantic_intent or len(terms) >= 4 else "none",
+        "candidate_limit": args.candidate_limit,
+        "rerank_top": args.rerank_top,
+        "bm25_weight": args.bm25_weight,
+        "semantic_weight": args.semantic_weight,
+        "entity_weight": args.entity_weight,
+        "reasons": [],
+    }
+    if wants_frame:
+        plan["reasons"].append("frame/timestamp/OCR intent -> search keyframes")
+    if exact_intent:
+        plan["reasons"].append("exact/OCR text intent -> boost BM25 and keyframe search")
+        plan["bm25_weight"] = max(plan["bm25_weight"], 1.35)
+        plan["semantic_weight"] = min(plan["semantic_weight"], 0.75)
+        plan["search_level"] = "both"
+    if has_entity:
+        plan["reasons"].append("entity-like query -> boost entity matches")
+        plan["entity_weight"] = max(plan["entity_weight"], 0.65)
+        if uppercase_signal or len(terms) <= 2:
+            plan["reasons"].append("short/name-like query -> include keyframe OCR")
+            plan["search_level"] = "both"
+    if semantic_intent or len(terms) >= 4:
+        plan["reasons"].append("semantic/paraphrase query -> enable BGE reranking")
+        plan["reranker"] = "bge"
+        plan["semantic_weight"] = max(plan["semantic_weight"], 1.0)
+    if len(terms) <= 2 and has_entity and not semantic_intent:
+        plan["reasons"].append("short entity query -> BM25/entity without expensive reranker")
+        plan["reranker"] = "none"
+        plan["candidate_limit"] = min(plan["candidate_limit"], 40)
+        plan["semantic_weight"] = 0.0
+    if plan["reranker"] == "bge":
+        plan["candidate_limit"] = max(plan["candidate_limit"], 60)
+        plan["rerank_top"] = max(plan["rerank_top"], 50)
+    if not plan["reasons"]:
+        plan["reasons"].append("default hybrid scene retrieval")
+    return plan
+
+
+def apply_adaptive_plan(args: argparse.Namespace) -> argparse.Namespace:
+    if not args.adaptive:
+        return args
+    values = vars(args).copy()
+    plan = adaptive_plan(args)
+    for key in (
+        "mode", "search_level", "reranker", "candidate_limit", "rerank_top",
+        "bm25_weight", "semantic_weight", "entity_weight",
+    ):
+        values[key] = plan[key]
+    values["adaptive_plan"] = plan
+    return argparse.Namespace(**values)
+
+
+def semantic_args_for(args: argparse.Namespace, level: str) -> argparse.Namespace:
+    values = vars(args).copy()
+    if level == "keyframe":
+        values["index"] = args.keyframe_index
+        values["metadata"] = args.keyframe_metadata
+    return argparse.Namespace(**values)
+
+
 def semantic_search(args: argparse.Namespace, limit: int) -> list[SearchHit]:
     faiss = import_faiss()
     metadata = load_vector_metadata(args.metadata)
-    index = faiss.read_index(str(args.index))
+    tables = retrieval_tables(metadata.get("level") or "scene")
+    index = load_faiss_index(args.index)
     vector = query_embedding(args.query, metadata, args).reshape(1, -1).astype(np.float32)
     scores, indexes = index.search(vector, min(limit, int(metadata["count"])))
     document_ids = [metadata["document_ids"][int(index_value)] for index_value in indexes[0] if index_value >= 0]
@@ -1150,7 +1515,10 @@ def semantic_search(args: argparse.Namespace, limit: int) -> list[SearchHit]:
         return []
     placeholders = ",".join("?" for _ in document_ids)
     with connect(args.db) as connection:
-        rows = connection.execute(f"SELECT * FROM documents WHERE document_id IN ({placeholders})", document_ids).fetchall()
+        rows = connection.execute(
+            f"SELECT * FROM {tables['documents']} WHERE document_id IN ({placeholders})",
+            document_ids,
+        ).fetchall()
     by_id = {row["document_id"]: row for row in rows}
     hits: list[SearchHit] = []
     for rank, (document_id, score) in enumerate(zip(document_ids, scores[0]), start=1):
@@ -1266,21 +1634,53 @@ def print_hits(hits: list[SearchHit], as_json: bool) -> None:
         timestamp = hit.matched_timestamp if hit.matched_timestamp is not None else hit.start_seconds
         reranker = f" rerank={hit.reranker_score:.4f}" if hit.reranker_score is not None else ""
         print(
-            f"{index}. score={hit.final_score:.6f} video={hit.video_id} scene={hit.scene_id} "
+            f"{index}. score={hit.final_score:.6f} level={hit.level} video={hit.video_id} scene={hit.scene_id} "
             f"time={timestamp:.3f}s frame={frame}{reranker}"
         )
         print(f"   {snippet}")
         print(f"   https://www.youtube.com/watch?v={hit.video_id}&t={max(0, round(timestamp))}s")
 
 
-def search(args: argparse.Namespace) -> None:
+def run_search(args: argparse.Namespace) -> list[SearchHit]:
+    args = apply_adaptive_plan(args)
+    if args.show_plan and getattr(args, "adaptive_plan", None):
+        print(json.dumps(args.adaptive_plan, ensure_ascii=False), file=sys.stderr)
     # On Windows, loading FAISS before a Transformers model can crash inside
     # PyTorch weight loading. Construct the reranker before semantic_search.
     reranker = load_reranker(args)
-    bm25_hits = bm25_search(args.db, args.query, args.candidate_limit) if args.mode in {"bm25", "hybrid"} else []
-    tfidf_hits = tfidf_search(args.db, args.query, args.candidate_limit) if args.mode == "tfidf" else []
-    semantic_hits = semantic_search(args, args.candidate_limit) if args.mode in {"semantic", "hybrid"} else []
-    entity_hits = entity_search(args.db, args.query, args.candidate_limit) if args.mode in {"entity", "hybrid"} else []
+    if args.reranker != "none" and reranker is None:
+        args = argparse.Namespace(**{**vars(args), "reranker": "none"})
+    levels = ["scene", "keyframe"] if args.search_level == "both" else [args.search_level]
+    bm25_hits: list[SearchHit] = []
+    tfidf_hits: list[SearchHit] = []
+    semantic_hits: list[SearchHit] = []
+    entity_hits: list[SearchHit] = []
+    if args.mode in {"bm25", "hybrid"}:
+        for level in levels:
+            bm25_hits.extend(bm25_search(args.db, args.query, args.candidate_limit, level))
+    if args.mode == "tfidf":
+        if args.search_level != "scene":
+            raise RuntimeError("TF-IDF mode currently supports scene-level only. Use --mode bm25 or --mode hybrid.")
+        tfidf_hits = tfidf_search(args.db, args.query, args.candidate_limit)
+    if args.mode in {"semantic", "hybrid"} and args.semantic_weight > 0:
+        for level in levels:
+            semantic_args = semantic_args_for(args, level)
+            if level == "keyframe" and not semantic_args.metadata.exists():
+                if args.search_level == "keyframe":
+                    raise RuntimeError(
+                        f"Keyframe vector metadata not found: {semantic_args.metadata}. "
+                        "Run retrieval-pipeline embed --level keyframe first."
+                    )
+                continue
+            try:
+                semantic_hits.extend(semantic_search(semantic_args, args.candidate_limit))
+            except RuntimeError as exc:
+                if not getattr(args, "semantic_fallback", True):
+                    raise
+                print(f"[semantic] disabled for {level}: {exc}", file=sys.stderr)
+    if args.mode in {"entity", "hybrid"}:
+        for level in levels:
+            entity_hits.extend(entity_search(args.db, args.query, args.candidate_limit, level))
     if args.mode == "bm25":
         hits = [SearchHit(**{**hit.__dict__, "final_score": 1.0 / (args.rrf_k + (hit.bm25_rank or 1))}) for hit in bm25_hits]
     elif args.mode == "tfidf":
@@ -1292,7 +1692,11 @@ def search(args: argparse.Namespace) -> None:
     else:
         hits = merge_hits(args, bm25_hits, semantic_hits, entity_hits)
     hits = rerank_hits(args, hits, reranker)
-    print_hits(temporal_deduplicate(hits, args.dedupe_seconds, args.limit), args.json)
+    return temporal_deduplicate(hits, args.dedupe_seconds, args.limit)
+
+
+def search(args: argparse.Namespace) -> None:
+    print_hits(run_search(args), args.json)
 
 
 def main() -> None:
@@ -1306,6 +1710,7 @@ def main() -> None:
             args.documents,
             args.db,
             args.overwrite,
+            args.incremental,
             args.aliases,
             args.ner_provider,
             args.ner_model,

@@ -23,6 +23,7 @@ gemini-summary = "youtube_pipeline.gemini_summary:main"
 document-pipeline = "youtube_pipeline.documents:main"
 retrieval-pipeline = "youtube_pipeline.retrieval:main"
 retrieval-eval = "youtube_pipeline.evaluation:main"
+retrieval-server = "youtube_pipeline.retrieval_server:main"
 
 [project.optional-dependencies]
 ocr = [

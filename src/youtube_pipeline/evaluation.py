@@ -16,6 +16,8 @@ from typing import Any
 from .retrieval import (
     DEFAULT_DB,
     DEFAULT_FAISS_INDEX,
+    DEFAULT_KEYFRAME_FAISS_INDEX,
+    DEFAULT_KEYFRAME_VECTOR_METADATA,
     DEFAULT_VECTOR_METADATA,
     TOKEN_PATTERN,
     bm25_search,
@@ -23,6 +25,8 @@ from .retrieval import (
     load_reranker,
     merge_hits,
     rerank_hits,
+    apply_adaptive_plan,
+    semantic_args_for,
     semantic_search,
     tfidf_search,
 )
@@ -58,6 +62,10 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--queries", type=Path, default=DEFAULT_QUERIES)
     run.add_argument("--index", type=Path, default=DEFAULT_FAISS_INDEX)
     run.add_argument("--metadata", type=Path, default=DEFAULT_VECTOR_METADATA)
+    run.add_argument("--keyframe-index", type=Path, default=DEFAULT_KEYFRAME_FAISS_INDEX)
+    run.add_argument("--keyframe-metadata", type=Path, default=DEFAULT_KEYFRAME_VECTOR_METADATA)
+    run.add_argument("--search-level", choices=["scene", "keyframe", "both"], default="scene")
+    run.add_argument("--adaptive", action="store_true")
     run.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     run.add_argument("--details", type=Path, default=DEFAULT_DETAILS)
     run.add_argument("--modes", default="bm25,tfidf,semantic,entity,hybrid")
@@ -70,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     run.add_argument("--bm25-weight", type=float, default=1.0)
     run.add_argument("--semantic-weight", type=float, default=1.0)
+    run.add_argument("--semantic-fallback", action=argparse.BooleanOptionalAction, default=True)
     run.add_argument("--entity-weight", type=float, default=0.35)
     run.add_argument("--rrf-k", type=int, default=60)
     run.add_argument("--reranker", choices=["none", "bge"], default="none")
@@ -80,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     run.add_argument("--reranker-max-length", type=int, default=256)
     run.add_argument("--reranker-min-final-score", type=float, default=0.20)
     run.add_argument("--reranker-max-score-drop", type=float, default=6.0)
+    run.add_argument("--reranker-fallback", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -259,12 +269,18 @@ def search_args(args: argparse.Namespace, query: str) -> SimpleNamespace:
         db=args.db,
         index=args.index,
         metadata=args.metadata,
+        keyframe_index=args.keyframe_index,
+        keyframe_metadata=args.keyframe_metadata,
+        search_level=args.search_level,
+        adaptive=args.adaptive,
+        show_plan=False,
         provider=args.provider,
         model=args.model,
         api_key=args.api_key,
         ollama_url=args.ollama_url,
         bm25_weight=args.bm25_weight,
         semantic_weight=args.semantic_weight,
+        semantic_fallback=args.semantic_fallback,
         entity_weight=args.entity_weight,
         rrf_k=args.rrf_k,
         reranker=args.reranker,
@@ -275,15 +291,33 @@ def search_args(args: argparse.Namespace, query: str) -> SimpleNamespace:
         reranker_max_length=args.reranker_max_length,
         reranker_min_final_score=args.reranker_min_final_score,
         reranker_max_score_drop=args.reranker_max_score_drop,
+        reranker_fallback=args.reranker_fallback,
     )
 
 
 def retrieve(mode: str, args: argparse.Namespace, query: str, reranker: Any | None = None) -> list[Any]:
-    bm25_hits = bm25_search(args.db, query, args.candidate_limit) if mode in {"bm25", "hybrid"} else []
+    args = apply_adaptive_plan(search_args(args, query))
+    mode = args.mode if args.adaptive else mode
+    levels = ["scene", "keyframe"] if args.search_level == "both" else [args.search_level]
+    bm25_hits: list[Any] = []
+    semantic_hits: list[Any] = []
+    entity_hits: list[Any] = []
+    if mode in {"bm25", "hybrid"}:
+        for level in levels:
+            bm25_hits.extend(bm25_search(args.db, query, args.candidate_limit, level))
+    if mode == "tfidf" and args.search_level != "scene":
+        raise RuntimeError("TF-IDF evaluation currently supports scene-level only.")
     tfidf_hits = tfidf_search(args.db, query, args.candidate_limit) if mode == "tfidf" else []
-    semantic_args = search_args(args, query)
-    semantic_hits = semantic_search(semantic_args, args.candidate_limit) if mode in {"semantic", "hybrid"} else []
-    entity_hits = entity_search(args.db, query, args.candidate_limit) if mode in {"entity", "hybrid"} else []
+    semantic_args = args
+    if mode in {"semantic", "hybrid"} and args.semantic_weight > 0:
+        for level in levels:
+            current_args = semantic_args_for(semantic_args, level)
+            if level == "keyframe" and not current_args.metadata.exists():
+                continue
+            semantic_hits.extend(semantic_search(current_args, args.candidate_limit))
+    if mode in {"entity", "hybrid"}:
+        for level in levels:
+            entity_hits.extend(entity_search(args.db, query, args.candidate_limit, level))
     if mode == "bm25":
         return bm25_hits
     if mode == "tfidf":
